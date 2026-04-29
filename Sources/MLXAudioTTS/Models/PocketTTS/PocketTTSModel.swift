@@ -211,6 +211,22 @@ public final class PocketTTSModel: Module, SpeechGenerationModel, @unchecked Sen
         framesAfterEos: Int?,
         maxFrames: Int?
     ) throws -> [MLXArray] {
+        try generateAudioStream(
+            state: state,
+            text: text,
+            framesAfterEos: framesAfterEos,
+            maxFrames: maxFrames,
+            onChunk: nil
+        )
+    }
+
+    private func generateAudioStream(
+        state: PocketTTSState?,
+        text: String,
+        framesAfterEos: Int?,
+        maxFrames: Int?,
+        onChunk: ((MLXArray) throws -> Void)?
+    ) throws -> [MLXArray] {
         guard var state else {
             throw NSError(domain: "PocketTTSModel", code: 3, userInfo: [NSLocalizedDescriptionKey: "Missing generation state"])
         }
@@ -222,7 +238,13 @@ public final class PocketTTSModel: Module, SpeechGenerationModel, @unchecked Sen
             sliceFlowCache(&state, to: promptNumFrames)
             let (_, guess) = try PocketTTSTextUtils.prepareTextPrompt(chunk)
             let frames = framesAfterEos ?? (guess + 2)
-            let audioChunks = try generateAudioStreamShortText(state: &state, text: chunk, framesAfterEos: frames, maxFrames: maxFrames)
+            let audioChunks = try generateAudioStreamShortText(
+                state: &state,
+                text: chunk,
+                framesAfterEos: frames,
+                maxFrames: maxFrames,
+                onChunk: onChunk
+            )
             outputs.append(contentsOf: audioChunks)
         }
         return outputs
@@ -232,7 +254,8 @@ public final class PocketTTSModel: Module, SpeechGenerationModel, @unchecked Sen
         state: inout PocketTTSState,
         text: String,
         framesAfterEos: Int,
-        maxFrames: Int?
+        maxFrames: Int?,
+        onChunk: ((MLXArray) throws -> Void)? = nil
     ) throws -> [MLXArray] {
         mimi.resetState()
         var outputs: [MLXArray] = []
@@ -263,7 +286,9 @@ public final class PocketTTSModel: Module, SpeechGenerationModel, @unchecked Sen
             let decodingInput = nextLatent * flow_lm.emb_std + flow_lm.emb_mean
             let quantized = mimi.quantizer(decodingInput.transposed(0, 2, 1))
             let audioChunk = mimi.decodeStep(quantized)
-            outputs.append(audioChunk.squeezed())
+            let squeezed = audioChunk.squeezed()
+            outputs.append(squeezed)
+            try onChunk?(squeezed)
             backboneInput = nextLatent
         }
 
@@ -318,16 +343,38 @@ public final class PocketTTSModel: Module, SpeechGenerationModel, @unchecked Sen
         let task = Task { @Sendable [weak self] in
             guard let self else { return }
             do {
-                let audio = try await self.generate(
+                _ = refText
+                _ = language
+
+                let prompt = try await self.resolveAudioPrompt(voice: voice, refAudio: refAudio)
+                let state = self.getStateForAudioPrompt(prompt)
+
+                let prevTemp = self.temp
+                let prevLsd = self.lsd_decode_steps
+                let prevNoise = self.noise_clamp
+                let prevEos = self.eos_threshold
+
+                self.temp = generationParameters.temperature
+
+                defer {
+                    self.temp = prevTemp
+                    self.lsd_decode_steps = prevLsd
+                    self.noise_clamp = prevNoise
+                    self.eos_threshold = prevEos
+                }
+
+                try self.generateAudioStream(
+                    state: state,
                     text: text,
-                    voice: voice,
-                    refAudio: refAudio,
-                    refText: refText,
-                    language: language,
-                    generationParameters: generationParameters
-                )
-                continuation.yield(.audio(audio))
+                    framesAfterEos: nil,
+                    maxFrames: generationParameters.maxTokens
+                ) { audioChunk in
+                    try Task.checkCancellation()
+                    continuation.yield(.audio(audioChunk))
+                }
                 continuation.finish()
+            } catch is CancellationError {
+                continuation.finish(throwing: CancellationError())
             } catch {
                 continuation.finish(throwing: error)
             }
