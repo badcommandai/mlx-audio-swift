@@ -311,6 +311,23 @@ public class SopranoModel: Module, KVCacheDimensionProvider, SpeechGenerationMod
         )
     }
 
+    public func generateStream(
+        text: String,
+        voice: String?,
+        refAudio _: MLXArray?,
+        refText _: String?,
+        language _: String?,
+        generationParameters: GenerateParameters,
+        streamingInterval: Double
+    ) -> AsyncThrowingStream<AudioGeneration, Error> {
+        generateStream(
+            text: text,
+            voice: voice,
+            parameters: generationParameters,
+            streamingInterval: streamingInterval
+        )
+    }
+
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
         var sanitized: [String: MLXArray] = [:]
 
@@ -699,7 +716,8 @@ public class SopranoModel: Module, KVCacheDimensionProvider, SpeechGenerationMod
             topP: 0.95,
             repetitionPenalty: 1.5,
             repetitionContextSize: 30
-        )
+        ),
+        streamingInterval: Double = 0.35
     ) -> AsyncThrowingStream<SopranoGeneration, Error> {
         let (stream, continuation) = AsyncThrowingStream<SopranoGeneration, Error>.makeStream()
         let task = Task { @Sendable [weak self, continuation] in
@@ -716,14 +734,48 @@ public class SopranoModel: Module, KVCacheDimensionProvider, SpeechGenerationMod
                 let startTime = Date()
                 let sentenceData = self.preprocessText([prompt])
                 
-                var audioParts: [MLXArray] = []
                 var totalTokens = 0
                 let maxTokens = parameters.maxTokens ?? 512
+                let secondsPerToken = Double(self.configuration.tokenSize) / Double(max(1, self.configuration.sampleRate))
+                let streamTokenWindow = max(4, Int((streamingInterval / max(secondsPerToken, 0.001)).rounded()))
+                let stableTailFrames = self.configuration.tokenSize * max(2, self.configuration.receptiveField)
                 
                 for (promptText, _, _) in sentenceData {
                     try Task.checkCancellation()
                     let inputIds = self.tokenize(promptText)
                     var allHiddenStates: [MLXArray] = []
+                    var emittedAudioFrames = 0
+                    var tokensSinceLastAudio = 0
+
+                    func emitDecodedAudio(isFinal: Bool) {
+                        let tokenCount = allHiddenStates.count
+                        guard tokenCount > 1 else { return }
+
+                        let hiddenStates = MLX.concatenated(allHiddenStates, axis: 1)
+                        var audio = self.decoder(hiddenStates)
+                        let audioLength = tokenCount * self.configuration.tokenSize - self.configuration.tokenSize
+
+                        if audioLength > 0 {
+                            audio = audio[0, (-audioLength)...]
+                        } else {
+                            audio = audio[0]
+                        }
+
+                        let samples = audio.asArray(Float.self)
+                        guard !samples.isEmpty else { return }
+
+                        let emitEnd: Int
+                        if isFinal {
+                            emitEnd = samples.count
+                        } else {
+                            emitEnd = max(emittedAudioFrames, samples.count - stableTailFrames)
+                        }
+                        guard emitEnd > emittedAudioFrames else { return }
+
+                        let chunk = Array(samples[emittedAudioFrames..<emitEnd])
+                        emittedAudioFrames = emitEnd
+                        continuation.yield(.audio(MLXArray(chunk)))
+                    }
                     
                     for await (token, hiddenState) in self.streamGenerate(
                         inputIds: inputIds,
@@ -738,39 +790,20 @@ public class SopranoModel: Module, KVCacheDimensionProvider, SpeechGenerationMod
                         if let tokenVal = token {
                             continuation.yield(.token(tokenVal))
                         }
+                        tokensSinceLastAudio += 1
+                        totalTokens += token == nil ? 0 : 1
+
+                        if tokensSinceLastAudio >= streamTokenWindow {
+                            try Task.checkCancellation()
+                            emitDecodedAudio(isFinal: false)
+                            tokensSinceLastAudio = 0
+                        }
                     }
                     try Task.checkCancellation()
-                    
-                    let tokenCount = allHiddenStates.count
-                    totalTokens += tokenCount
-                    
-                    // Stack hidden states
-                    let hiddenStates = MLX.concatenated(allHiddenStates, axis: 1)
-                    
-                    // Decode to audio
-                    var audio = self.decoder(hiddenStates)
-                    
-                    let tokenSize = self.configuration.tokenSize
-                    let audioLength = tokenCount * tokenSize - tokenSize
-                    
-                    if audioLength > 0 {
-                        audio = audio[0, (-audioLength)...]
-                    } else {
-                        audio = audio[0]
-                    }
-                    
-                    audioParts.append(audio)
+                    emitDecodedAudio(isFinal: true)
                 }
                 
                 try Task.checkCancellation()
-
-                // Concatenate audio
-                let finalAudio: MLXArray
-                if audioParts.count > 1 {
-                    finalAudio = MLX.concatenated(audioParts, axis: 0)
-                } else {
-                    finalAudio = audioParts[0]
-                }
                 
                 let elapsed = Date().timeIntervalSince(startTime)
                 
@@ -784,9 +817,6 @@ public class SopranoModel: Module, KVCacheDimensionProvider, SpeechGenerationMod
                     peakMemoryUsage: Double(Memory.peakMemory) / 1e9
                 )
                 continuation.yield(.info(info))
-                
-                // Yield audio
-                continuation.yield(.audio(finalAudio))
                 
                 continuation.finish()
             } catch {
